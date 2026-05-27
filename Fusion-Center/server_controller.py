@@ -139,76 +139,94 @@ def _network_average(
     pair_weights: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Weighted graph-style network averaging (port of get_averaged_calibration.m, robust version).
+    Multi-pass weighted network averaging.
+
+    Iterates up to num_nodes-1 passes, each time using the fused estimates
+    from the previous pass as bridge legs.  This makes every connected pair
+    reachable regardless of chain length or which node is chosen as reference.
+
+      Pass 1 = direct paths + 1-hop bridges (same as the old single-pass).
+      Pass k = propagates transforms up to k+1 hops from raw RANSAC pairs.
+
+    Stops early when no new pairs gain non-zero weight (full connectivity
+    reached).  For a linear chain of N nodes, at most N-2 passes are needed.
 
     For each (ref, i) entry averages:
-      - Direct path  (k = ref): P[ref,i], weight = pair_weights[ref,i]
-      - Indirect via k:         P[ref,k] + exp(j*theta[ref,k]) * P[k,i],
-                                weight = min(pair_weights[ref,k], pair_weights[k,i])
+      - Direct leg  (k == ref): P_cur[ref,i],  weight = w_cur[ref,i]
+      - Bridge via k:           P_cur[ref,k] + exp(j*theta[ref,k]) * P_cur[k,i],
+                                weight = min(w_cur[ref,k], w_cur[k,i])
 
     Angle averaging uses complex exponentials to handle wrap-around correctly.
-    Paths with zero weight (unsolved pairs) are skipped.
-    Falls back to the direct estimate when no indirect paths are valid.
 
     Returns (P_fused, theta_fused, weight_fused).
     """
     num_nodes = P_raw.shape[0]
-    P_fused = np.zeros((num_nodes, num_nodes), dtype=np.complex128)
-    theta_fused = np.zeros((num_nodes, num_nodes), dtype=np.float64)
-    weight_fused = np.zeros((num_nodes, num_nodes), dtype=np.float64)
 
-    for ref in range(num_nodes):
-        for i in range(num_nodes):
-            if ref == i:
-                continue
+    P_cur     = P_raw.copy()
+    theta_cur = theta_raw.copy()
+    w_cur     = pair_weights.copy()
 
-            pos_num = 0.0 + 0.0j
-            theta_num = 0.0 + 0.0j
-            weight_sum = 0.0
+    for _pass in range(num_nodes - 1):
+        P_next     = np.zeros((num_nodes, num_nodes), dtype=np.complex128)
+        theta_next = np.zeros((num_nodes, num_nodes), dtype=np.float64)
+        w_next     = np.zeros((num_nodes, num_nodes), dtype=np.float64)
 
-            for k in range(num_nodes):
-                if k == i:
-                    # Skipping k==i avoids double-counting the direct path
+        for ref in range(num_nodes):
+            for i in range(num_nodes):
+                if ref == i:
                     continue
 
-                if k == ref:
-                    # Direct path (ref -> i)
-                    w = pair_weights[ref, i]
-                    if w <= 0.0:
+                pos_num    = 0.0 + 0.0j
+                theta_num  = 0.0 + 0.0j
+                weight_sum = 0.0
+
+                for k in range(num_nodes):
+                    if k == i:
                         continue
-                    candidate_P = P_raw[ref, i]
-                    candidate_theta_rad = np.deg2rad(theta_raw[ref, i])
-                    path_weight = w
+
+                    if k == ref:
+                        # Direct leg using the current fused estimate.
+                        w = w_cur[ref, i]
+                        if w <= 0.0:
+                            continue
+                        path_weight    = w
+                        candidate_P    = P_cur[ref, i]
+                        candidate_trad = np.deg2rad(theta_cur[ref, i])
+                    else:
+                        # Bridge via k: both legs must have non-zero weight.
+                        w_rk = w_cur[ref, k]
+                        w_ki = w_cur[k, i]
+                        if w_rk <= 0.0 or w_ki <= 0.0:
+                            continue
+                        path_weight    = min(w_rk, w_ki)
+                        candidate_P    = (
+                            P_cur[ref, k]
+                            + np.exp(1j * np.deg2rad(theta_cur[ref, k])) * P_cur[k, i]
+                        )
+                        candidate_trad = np.deg2rad(
+                            theta_cur[ref, k] + theta_cur[k, i]
+                        )
+
+                    pos_num    += path_weight * candidate_P
+                    theta_num  += path_weight * np.exp(1j * candidate_trad)
+                    weight_sum += path_weight
+
+                if weight_sum > 0.0:
+                    P_next[ref, i]     = pos_num / weight_sum
+                    theta_next[ref, i] = float(np.rad2deg(np.angle(theta_num))) % 360.0
+                    w_next[ref, i]     = weight_sum
                 else:
-                    # Indirect path via k: (ref -> k -> i)
-                    w_rk = pair_weights[ref, k]
-                    w_ki = pair_weights[k, i]
-                    if w_rk <= 0.0 or w_ki <= 0.0:
-                        continue
-                    candidate_P = (
-                        P_raw[ref, k]
-                        + np.exp(1j * np.deg2rad(theta_raw[ref, k])) * P_raw[k, i]
-                    )
-                    candidate_theta_rad = np.deg2rad(
-                        theta_raw[ref, k] + theta_raw[k, i]
-                    )
-                    path_weight = min(w_rk, w_ki)
+                    # No path found: carry forward current (possibly zero) estimate.
+                    P_next[ref, i]     = P_cur[ref, i]
+                    theta_next[ref, i] = float(theta_cur[ref, i]) % 360.0
+                    w_next[ref, i]     = w_cur[ref, i]
 
-                pos_num += path_weight * candidate_P
-                theta_num += path_weight * np.exp(1j * candidate_theta_rad)
-                weight_sum += path_weight
+        prev_nonzero = int(np.sum(w_cur > 0))
+        P_cur, theta_cur, w_cur = P_next, theta_next, w_next
+        if int(np.sum(w_cur > 0)) == prev_nonzero:
+            break  # Full connectivity reached; further passes would not add new pairs.
 
-            if weight_sum > 0.0:
-                P_fused[ref, i] = pos_num / weight_sum
-                theta_fused[ref, i] = float(np.rad2deg(np.angle(theta_num))) % 360.0
-                weight_fused[ref, i] = weight_sum
-            else:
-                # Fallback: use direct estimate as-is
-                P_fused[ref, i] = P_raw[ref, i]
-                theta_fused[ref, i] = float(theta_raw[ref, i]) % 360.0
-                weight_fused[ref, i] = pair_weights[ref, i]
-
-    return P_fused, theta_fused, weight_fused
+    return P_cur, theta_cur, w_cur
 
 
 def closed_form_calibration(
